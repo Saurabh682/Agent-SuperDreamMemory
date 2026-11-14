@@ -20,7 +20,9 @@ param(
     [string]$Action = 'menu',
     [string]$Project,
     [string]$Tool,
-    [string]$Profile,
+    # Not named $Profile, which would shadow PowerShell's automatic $PROFILE; -Profile still works as an alias
+    [Alias('Profile')]
+    [string]$ProjectProfile,
     [switch]$Yes
 )
 
@@ -83,11 +85,23 @@ function Run-Git([string]$dir, [string[]]$gitArgs) {
     finally { $ErrorActionPreference = $old }
 }
 
+function Assert-BlockMarkers([string]$file, [string]$text) {
+    # Exactly zero or one well-ordered start/end pair; anything else was hand-edited and is not safe to rewrite
+    $starts = ([regex]::Matches($text, [regex]::Escape($script:StartMark))).Count
+    $ends = ([regex]::Matches($text, [regex]::Escape($script:EndMark))).Count
+    $ok = ($starts -eq 0 -and $ends -eq 0) -or
+          ($starts -eq 1 -and $ends -eq 1 -and $text.IndexOf($script:StartMark) -lt $text.IndexOf($script:EndMark))
+    if (-not $ok) {
+        throw ('Damaged agent-memory block in ' + $file + ' (' + $starts + ' start / ' + $ends + ' end marker(s)). Fix it by hand so there is one start and one end marker, or none, then run again.')
+    }
+}
+
 function Set-Block([string]$file, [string]$body, [string]$where = 'end') {
     $block = $script:StartMark + "`r`n" + $body.Trim() + "`r`n" + $script:EndMark
     $existing = ''
     if (Test-Path -LiteralPath $file) {
         $existing = Read-Text $file
+        Assert-BlockMarkers $file $existing
         $bak = $file + '.agent-memory.bak'
         if (-not (Test-Path -LiteralPath $bak)) { Copy-Item -LiteralPath $file -Destination $bak }
     }
@@ -110,16 +124,24 @@ function Set-Block([string]$file, [string]$body, [string]$where = 'end') {
 function Remove-Block([string]$file) {
     if (-not (Test-Path -LiteralPath $file)) { return $false }
     $existing = Read-Text $file
-    $pattern = '(?s)\r?\n*' + [regex]::Escape($script:StartMark) + '.*?' + [regex]::Escape($script:EndMark) + '\r?\n*'
-    if (-not [regex]::IsMatch($existing, $pattern)) { return $false }
-    $new = [regex]::Replace($existing, $pattern, "`r`n")
-    Write-Text $file ($new.TrimEnd() + "`r`n")
+    Assert-BlockMarkers $file $existing
+    $pattern = '(?s)(?:\r?\n)*' + [regex]::Escape($script:StartMark) + '.*?' + [regex]::Escape($script:EndMark) + '(?:\r?\n)*'
+    $m = [regex]::Match($existing, $pattern)
+    if (-not $m.Success) { return $false }
+    # Rejoin what was around the block: nothing extra at the start or end of the file, one blank line in between
+    $before = $existing.Substring(0, $m.Index)
+    $after = $existing.Substring($m.Index + $m.Length)
+    if ($before.Length -eq 0) { $new = $after }
+    elseif ($after.Length -eq 0) { $new = $before }
+    else { $new = $before + "`r`n`r`n" + $after }
+    if ($new.Trim().Length -eq 0) { Write-Text $file '' } else { Write-Text $file ($new.TrimEnd() + "`r`n") }
     return $true
 }
 
 function Has-Block([string]$file) {
     if (-not (Test-Path -LiteralPath $file)) { return $false }
-    return (Read-Text $file).Contains($script:StartMark)
+    $text = Read-Text $file
+    return ($text.Contains($script:StartMark) -and $text.Contains($script:EndMark))
 }
 
 function Pick-Folder([string]$prompt, [string]$default) {
@@ -215,8 +237,20 @@ function Invoke-Install {
     foreach ($d in @('global', 'dream')) { New-Item -ItemType Directory -Force -Path (Join-Path $mem $d) | Out-Null }
 
     $map = @{ MEMORY_HOME = $mem; GLOBAL_FILE = (Join-Path $mem 'AGENTS.global.md'); GLOBAL_INDEX = (Join-Path $mem 'global/INDEX.md') }
-    Write-Text (Join-Path $mem 'AGENTS.global.md') (Fill (Get-Template 'AGENTS.global.md') $map)
-    Ok 'Wrote AGENTS.global.md (the shared rules every agent reads)'
+    $globalFile = Join-Path $mem 'AGENTS.global.md'
+    $globalText = Fill (Get-Template 'AGENTS.global.md') $map
+    if (-not (Test-Path -LiteralPath $globalFile)) {
+        Write-Text $globalFile $globalText
+        Ok 'Wrote AGENTS.global.md (the shared rules every agent reads)'
+    }
+    elseif ((Read-Text $globalFile) -ceq $globalText) {
+        Ok 'AGENTS.global.md is already up to date'
+    }
+    else {
+        # Never overwrite rules the user may have edited; leave the new version next to it
+        Write-Text ($globalFile + '.new') $globalText
+        Warn ('AGENTS.global.md differs from the kit template, so it was kept as it is. The template version is at ' + $globalFile + '.new; merge it by hand if you want it.')
+    }
 
     $idx = Join-Path $mem 'global/INDEX.md'
     if (-not (Test-Path -LiteralPath $idx)) {
@@ -247,8 +281,14 @@ function Invoke-Install {
                 Say ('  skip ' + $a.name + ': ' + $path + ' (not present, and createIfMissing is false)')
                 continue
             }
-            Set-Block $path $pointer 'end'
-            Ok ($a.name + ': ' + $path)
+            try { Set-Block $path $pointer 'end'; Ok ($a.name + ': ' + $path) }
+            catch { Warn ($a.name + ': ' + $_.Exception.Message) }
+        }
+    }
+    foreach ($a in @($cfg.agents | Where-Object { -not $_.enabled })) {
+        foreach ($g in $a.globalFiles) {
+            $path = Expand-Path $g.path
+            if (Has-Block $path) { Warn ($a.name + ' is disabled but ' + $path + ' still has a memory block. Run uninstall, or remove the block by hand, to disconnect it.') }
         }
     }
     Say ''
@@ -257,7 +297,11 @@ function Invoke-Install {
 }
 
 function Detect-Profile([string]$proj, $cfg) {
-    if ($script:Profile -and $cfg.profiles.PSObject.Properties.Name -contains $script:Profile) { return $script:Profile }
+    if (-not [string]::IsNullOrWhiteSpace($script:ProjectProfile)) {
+        $valid = @($cfg.profiles.PSObject.Properties.Name)
+        if ($valid -contains $script:ProjectProfile) { return $script:ProjectProfile }
+        throw ('Unknown profile "' + $script:ProjectProfile + '". Valid profiles: ' + ($valid -join ', '))
+    }
     $names = @(Get-ChildItem -LiteralPath $proj -Force -File | ForEach-Object { $_.Name })
     if ($names -contains 'build.gradle' -or $names -contains 'build.gradle.kts' -or $names -contains 'settings.gradle' -or $names -contains 'settings.gradle.kts') { return 'android' }
     if ($names -contains 'package.json') { return 'node' }
@@ -424,11 +468,15 @@ function Invoke-Review {
     # 1. Leak scan, paths only
     $hits = @()
     foreach ($f in (Get-ChildItem -LiteralPath $latest.FullName -Recurse -File)) {
-        $m = Select-String -LiteralPath $f.FullName -Pattern @($cfg.leakPatterns) -List -ErrorAction SilentlyContinue
-        if ($m) { $hits += $f.FullName }
+        # Fail closed: a file that cannot be scanned blocks the merge like a hit
+        try {
+            $m = Select-String -LiteralPath $f.FullName -Pattern @($cfg.leakPatterns) -List -ErrorAction Stop
+            if ($m) { $hits += $f.FullName }
+        }
+        catch { $hits += ($f.FullName + '   (could not be scanned: ' + $_.Exception.Message + ')') }
     }
     if ($hits.Count -gt 0) {
-        Warn 'Possible secrets or email addresses found in these files. Merge blocked:'
+        Warn 'Possible secrets or email addresses found (or files that could not be scanned). Merge blocked:'
         foreach ($h in $hits) { Say ('       ' + $h) 'Yellow' }
         Say '       Open them yourself, remove the data, then run Review again.' 'Yellow'
         return
@@ -443,6 +491,10 @@ function Invoke-Review {
         if (-not (Test-Path -LiteralPath $cur)) { $changes += ('NEW      ' + $f.Name) }
         elseif ((Get-FileHash -LiteralPath $cur).Hash -ne (Get-FileHash -LiteralPath $f.FullName).Hash) { $changes += ('CHANGED  ' + $f.Name) }
     }
+    # memory-next is a full copy of memory, so a file missing from it was removed by the proposal
+    $removed = @(Get-ChildItem -LiteralPath $mdir -Filter '*.md' -File -ErrorAction SilentlyContinue |
+        Where-Object { -not (Test-Path -LiteralPath (Join-Path $next $_.Name)) })
+    foreach ($r in $removed) { $changes += ('REMOVED  ' + $r.Name + '   (moved to archive, not deleted)') }
     if ($changes.Count -eq 0) { Say '  No memory files would change (the proposal is a no-op).' }
     else { foreach ($c in $changes) { Say ('  ' + $c) 'White' } }
 
@@ -465,19 +517,29 @@ function Invoke-Review {
     foreach ($f in (Get-ChildItem -LiteralPath $next -Filter '*.md' -File)) {
         Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $mdir $f.Name) -Force
     }
+    $arch = Join-Path $pm 'archive'
+    if ($removed.Count -gt 0) {
+        $removedDir = Join-Path $arch ('removed-' + $latest.Name)
+        New-Item -ItemType Directory -Force -Path $removedDir | Out-Null
+        foreach ($r in $removed) { Move-Item -LiteralPath $r.FullName -Destination (Join-Path $removedDir $r.Name) -Force }
+        Ok ('Moved ' + $removed.Count + ' removed memory file(s) to ' + $removedDir)
+    }
     Ok 'Merged into memory\'
-    $reportText = Read-Text $report
+    # Archive a note only when a report line names it exactly (not as part of a longer
+    # file name) and marks it consolidated or no-op. Failed notes stay in the inbox.
+    $reportLines = @((Read-Text $report) -split "`r?`n")
     $moved = 0
     foreach ($n in (Get-Notes $proj)) {
-        if ($reportText.Contains($n.Name)) {
-            $arch = Join-Path $pm 'archive'
+        $namePattern = '(?<![\w.-])' + [regex]::Escape($n.Name) + '(?![\w.-])'
+        $done = $reportLines | Where-Object { $_ -match $namePattern -and $_ -match '(?i)\b(consolidated|no-op)\b' }
+        if ($done) {
             Move-Item -LiteralPath $n.Path -Destination (Join-Path $arch $n.Name) -Force
             $moved++
         }
     }
     Ok ('Archived ' + $moved + ' processed note(s)')
     $left = @(Get-Notes $proj).Count
-    if ($left -gt 0) { Say ('  ' + $left + ' note(s) still in the inbox (not named in the report).') }
+    if ($left -gt 0) { Say ('  ' + $left + ' note(s) still in the inbox (not marked consolidated or no-op in the report).') }
     Say ''
     Say 'To track the memory in git (do not use "git add ."):' 'White'
     Say '  git add .agent-memory ; git commit -m "Update agent memory" -- .agent-memory' 'White'
@@ -493,12 +555,15 @@ function Invoke-Status([bool]$WithProject = $true) {
         foreach ($g in $a.globalFiles) {
             $path = Expand-Path $g.path
             $state = 'disabled'
-            if ($a.enabled) {
+            if (-not $a.enabled) {
+                if (Has-Block $path) { $state = 'disabled, STILL CONNECTED' }
+            }
+            else {
                 if (Has-Block $path) { $state = 'connected' }
                 elseif (-not (Test-Path -LiteralPath $path) -and -not $g.createIfMissing) { $state = 'n/a (no file)' }
                 else { $state = 'NOT connected' }
             }
-            Say ('  ' + $a.name.PadRight(16) + $state.PadRight(15) + $path)
+            Say ('  ' + $a.name.PadRight(16) + $state.PadRight(27) + $path)
         }
     }
     if (-not $WithProject) { return }
@@ -528,7 +593,8 @@ function Invoke-Uninstall {
     foreach ($a in $cfg.agents) {
         foreach ($g in $a.globalFiles) {
             $path = Expand-Path $g.path
-            if (Remove-Block $path) { Ok ('Removed block from ' + $path) }
+            try { if (Remove-Block $path) { Ok ('Removed block from ' + $path) } }
+            catch { Warn ($a.name + ': ' + $_.Exception.Message) }
         }
     }
     foreach ($rel in $cfg.projectPointerFiles) { Say ('  Project pointer files (' + $rel + ') must be cleaned per project: delete the agent-memory block by hand.') }
