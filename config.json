@@ -1,0 +1,95 @@
+{
+  "memoryHome": "~/.agent-memory",
+
+  "agents": [
+    {
+      "name": "codex",
+      "enabled": true,
+      "globalFiles": [
+        { "path": "~/.codex/AGENTS.md", "createIfMissing": true }
+      ]
+    },
+    {
+      "name": "antigravity",
+      "enabled": true,
+      "globalFiles": [
+        { "path": "~/.gemini/AGENTS.md", "createIfMissing": true },
+        { "path": "~/.gemini/GEMINI.md", "createIfMissing": false }
+      ]
+    },
+    {
+      "name": "claude-code",
+      "enabled": false,
+      "globalFiles": [
+        { "path": "~/.claude/CLAUDE.md", "createIfMissing": true }
+      ]
+    },
+    {
+      "name": "my-other-agent",
+      "enabled": false,
+      "globalFiles": [
+        { "path": "~/path/to/that/agents/global/instructions.md", "createIfMissing": true }
+      ]
+    }
+  ],
+
+  "projectPointerFiles": [],
+  "projectPointerPosition": "start",
+
+  "neverOpen": [
+    "*.jks, *.keystore, *.pem, *.p12, *.pfx",
+    ".env*, auth.json, .auth/, secrets/",
+    "Any CSV or export of emails, signups or user data",
+    "API keys, tokens, passwords or email addresses seen in any file, log or command output"
+  ],
+
+  "sensitiveFilePatterns": [
+    "*.jks", "*.keystore", "*.pem", "*.p12", "*.pfx",
+    ".env*", "auth.json", "keystore.properties", "local.properties",
+    "*credentials*", "*secret*", "id_rsa*",
+    "*email*.csv", "*signup*.csv", "*users*.csv"
+  ],
+  "sensitiveFolders": [".auth", ".secrets", "secrets"],
+
+  "backfill": {
+    "monthsBack": 12,
+    "maxItemsPerNote": 8
+  },
+
+  "dream": {
+    "staticOnly": true,
+    "maxIndexLines": 40,
+    "extraRules": []
+  },
+
+  "profiles": {
+    "default": {
+      "description": "General project",
+      "themes": ["build and tooling", "architecture", "testing", "recurring bugs"],
+      "extraNeverOpen": []
+    },
+    "android": {
+      "description": "Android app (Kotlin, Gradle)",
+      "themes": ["gradle and build setup", "compose state and UI", "room and background sync", "device-specific and release issues"],
+      "extraNeverOpen": ["local.properties", "keystore.properties"]
+    },
+    "node": {
+      "description": "Node / TypeScript project",
+      "themes": ["build and tooling", "server and API", "testing", "recurring bugs"],
+      "extraNeverOpen": []
+    },
+    "python": {
+      "description": "Python project",
+      "themes": ["environment and packaging", "architecture", "testing", "recurring bugs"],
+      "extraNeverOpen": []
+    }
+  },
+
+  "leakPatterns": [
+    "[\\w.+-]+@[\\w-]+\\.[A-Za-z]{2,}",
+    "AIza[0-9A-Za-z_-]{20,}",
+    "AKIA[0-9A-Z]{16}",
+    "gh[pousr]_[A-Za-z0-9]{30,}",
+    "BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY"
+  ]
+}
