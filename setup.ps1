@@ -144,6 +144,26 @@ function Has-Block([string]$file) {
     return ($text.Contains($script:StartMark) -and $text.Contains($script:EndMark))
 }
 
+function Get-RealPath([string]$path) {
+    # Follow symbolic links (up to 16 hops) to the file that is actually written
+    $p = $path
+    for ($i = 0; $i -lt 16; $i++) {
+        if (-not (Test-Path -LiteralPath $p)) { break }
+        $item = Get-Item -LiteralPath $p -Force
+        if ($item.LinkType -ne 'SymbolicLink') { break }
+        $t = [string](@($item.Target)[0])
+        if (-not [System.IO.Path]::IsPathRooted($t)) { $t = Join-Path (Split-Path -Parent $p) $t }
+        $p = $t
+    }
+    return [System.IO.Path]::GetFullPath($p)
+}
+
+function Is-SharedRulesFile([string]$path, [string]$mem) {
+    # True when an agent's global file is (a link to) the shared AGENTS.global.md itself
+    $shared = [System.IO.Path]::GetFullPath((Join-Path $mem 'AGENTS.global.md'))
+    return ((Get-RealPath $path) -ieq $shared)
+}
+
 function Pick-Folder([string]$prompt, [string]$default) {
     try {
         Add-Type -AssemblyName System.Windows.Forms
@@ -276,6 +296,11 @@ function Invoke-Install {
     foreach ($a in (Get-EnabledAgents $cfg)) {
         foreach ($g in $a.globalFiles) {
             $path = Expand-Path $g.path
+            if (Is-SharedRulesFile $path $mem) {
+                # Writing the pointer here would put it inside AGENTS.global.md, pointing at itself
+                Ok ($a.name + ': ' + $path + ' links to AGENTS.global.md, so it already reads the shared rules (left unchanged)')
+                continue
+            }
             $exists = Test-Path -LiteralPath $path
             if (-not $exists -and -not $g.createIfMissing) {
                 Say ('  skip ' + $a.name + ': ' + $path + ' (not present, and createIfMissing is false)')
@@ -559,7 +584,8 @@ function Invoke-Status([bool]$WithProject = $true) {
                 if (Has-Block $path) { $state = 'disabled, STILL CONNECTED' }
             }
             else {
-                if (Has-Block $path) { $state = 'connected' }
+                if (Is-SharedRulesFile $path $mem) { $state = 'connected (link)' }
+                elseif (Has-Block $path) { $state = 'connected' }
                 elseif (-not (Test-Path -LiteralPath $path) -and -not $g.createIfMissing) { $state = 'n/a (no file)' }
                 else { $state = 'NOT connected' }
             }
